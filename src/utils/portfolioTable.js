@@ -2,6 +2,7 @@
 import { performanceData, getSymphonyDailyChange, getAccountDeploys, getSymphonyStatsMeta, getSymphonyActivityHistory } from "../apiService.js";
 import { addGeneratedSymphonyStatsToSymphony, addQuantstatsToSymphony, addGeneratedSymphonyStatsToSymphonyWithModifiedDietz } from "./liveSymphonyPerformance.js";
 import { calculateActiveCagr, injectActiveCagrWithTooltip, injectActiveCagrLoadingPlaceholder } from "./portfolioCAGR.js";
+import { computeTotalPortfolioStats } from "./portfolioSummary.js";
 import { log } from "./logger.js";
 import {
   setupNativeColumnListener,
@@ -109,6 +110,9 @@ export const startSymphonyPerformanceSync = async (mainTable) => {
       injectActiveCagrWithTooltip(activeCagrStats);
     }
   }
+
+  // Render the portfolio-wide "Total Portfolio" summary row.
+  await renderTotalPortfolioRow(mainTable);
 };
 
 const TwelveHours = 12 * 60 * 60 * 1000; // this should only update once per day ish base on a normal user's usage. It could happen multiple times if multiple windows are open. or if the user is refreshing every 12 hours.
@@ -208,6 +212,7 @@ export function updateTableRows() {
   performanceData?.symphonyStats?.symphonies?.forEach?.((symphony) => {
     if (symphony.addedStats) {
       for (let row of rows) {
+        if (row.classList.contains("cqt-total-portfolio-row")) continue;
         // Use robust ID extraction that handles various row states
         const symphonyId = getSymphonyIdFromRow(row);
         if (symphonyId == symphony.id) {
@@ -217,6 +222,12 @@ export function updateTableRows() {
       }
     }
   });
+
+  // Re-assert the Total Portfolio summary row if Composer re-rendered the tbody
+  // and wiped it (stats are cached from the initial compute).
+  if (totalPortfolioStats && !document.querySelector("tr.cqt-total-portfolio-row")) {
+    injectTotalPortfolioRow();
+  }
 }
 
 export function extendSymphonyStatsRow(symphony) {
@@ -230,6 +241,144 @@ export function extendSymphonyStatsRow(symphony) {
       break;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Total Portfolio summary row
+// ---------------------------------------------------------------------------
+
+let totalPortfolioStats = null;
+
+// Compute portfolio-wide stats from all loaded symphonies, then render/refresh
+// the pinned "TOTAL PORTFOLIO" row at the top of the table.
+export async function renderTotalPortfolioRow(mainTable) {
+  try {
+    const symphonies = performanceData?.symphonyStats?.symphonies || [];
+    if (!symphonies.length) return;
+    const stats = await computeTotalPortfolioStats(symphonies);
+    if (!stats) return;
+    totalPortfolioStats = stats;
+    injectTotalPortfolioRow(mainTable);
+  } catch (e) {
+    log("Error rendering Total Portfolio row", e);
+  }
+}
+
+// "TOTAL PORTFOLIO" label + a (?) badge that reveals an explanation on hover.
+// Self-contained inline styles + a fixed-position tooltip so it doesn't depend
+// on app CSS and never gets clipped by the table's overflow.
+const TOTAL_PORTFOLIO_TOOLTIP =
+  "Whole-book summary built from the daily returns of ALL your symphonies.\n\n" +
+  "• Each day uses only the symphonies that existed that day, so strategies " +
+  "of different ages mix fine (the row's Running Days = your longest-running symphony).\n" +
+  "• Each symphony's daily return is weighted by its CURRENT dollar value, then " +
+  "averaged into one portfolio return per day.\n" +
+  "• That combined daily series is run through the same stats engine as each " +
+  "row, so every metric means the same thing — just for the whole book.\n\n" +
+  "Note: it applies today's allocation across all history. It's a portfolio-" +
+  "behavior estimate, not an exact realized account record.";
+
+function buildTotalPortfolioLabel() {
+  const wrap = document.createElement("span");
+  wrap.style.cssText = "display:inline-flex;align-items:center;gap:6px;";
+
+  const label = document.createElement("span");
+  label.textContent = "TOTAL PORTFOLIO";
+  wrap.appendChild(label);
+
+  const badge = document.createElement("span");
+  badge.textContent = "?";
+  badge.style.cssText = [
+    "display:inline-flex", "align-items:center", "justify-content:center",
+    "width:15px", "height:15px", "border-radius:50%",
+    "border:1px solid rgba(0,0,0,0.35)", "color:rgba(0,0,0,0.55)",
+    "font-size:10px", "font-weight:700", "line-height:1", "cursor:help",
+    "user-select:none", "flex:none",
+  ].join(";");
+  wrap.appendChild(badge);
+
+  let tip = null;
+  const show = () => {
+    if (tip) return;
+    tip = document.createElement("div");
+    tip.textContent = TOTAL_PORTFOLIO_TOOLTIP;
+    tip.style.cssText = [
+      "position:fixed", "z-index:99999", "max-width:360px",
+      "white-space:pre-wrap", "background:rgba(20,22,28,0.98)", "color:#fff",
+      "padding:12px 14px", "border-radius:8px", "font-size:12px",
+      "font-weight:400", "line-height:1.5", "box-shadow:0 4px 16px rgba(0,0,0,0.35)",
+      "pointer-events:none",
+    ].join(";");
+    document.body.appendChild(tip);
+    const r = badge.getBoundingClientRect();
+    let left = r.right + 10;
+    let top = r.top;
+    const tr = tip.getBoundingClientRect();
+    if (left + tr.width > window.innerWidth - 10) left = r.left - tr.width - 10;
+    if (left < 10) left = 10;
+    if (top + tr.height > window.innerHeight - 10) {
+      top = Math.max(10, window.innerHeight - tr.height - 10);
+    }
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+  };
+  const hide = () => { tip?.remove(); tip = null; };
+  badge.addEventListener("mouseenter", show);
+  badge.addEventListener("mouseleave", hide);
+
+  return wrap;
+}
+
+// Build (or rebuild) the summary row. Idempotent: removes any prior one first.
+// Populates ONLY the user's currently-selected extraColumns, with the same cell
+// markup as a normal row so widths/alignment match.
+export function injectTotalPortfolioRow(mainTable) {
+  if (!totalPortfolioStats) return;
+  const table = mainTable || document.querySelector("main :not(.tv-lightweight-charts) > table");
+  const tbody = table?.querySelector("tbody");
+  if (!tbody) return;
+
+  // Use a real row as a structural template so the leading (native) cells line up.
+  const templateRow = tbody.querySelector("tr:not(.cqt-total-portfolio-row)");
+  if (!templateRow) return;
+
+  tbody.querySelector("tr.cqt-total-portfolio-row")?.remove();
+
+  const row = document.createElement("tr");
+  row.className = templateRow.className + " cqt-total-portfolio-row";
+  row.style.borderBottom = "2px solid rgba(0,0,0,0.15)";
+  row.style.background = "rgba(59,130,246,0.06)";
+  row.style.fontWeight = "600";
+
+  // Recreate the native (non-extra) leading cells as blanks, except the first
+  // one which gets the "TOTAL PORTFOLIO" label + (?) tooltip.
+  const nativeCells = templateRow.querySelectorAll("td:not(.extra-column)");
+  nativeCells.forEach((tmpl, i) => {
+    const td = document.createElement("td");
+    td.className = tmpl.className;
+    if (i === 0) {
+      td.appendChild(buildTotalPortfolioLabel());
+      td.style.fontWeight = "700";
+    }
+    row.appendChild(td);
+  });
+
+  // Then the extra-column cells, same order/keys as everything else, so only
+  // currently-selected metrics get values.
+  extraColumns.forEach((key) => {
+    const cell = document.createElement("td");
+    cell.className = "table-cell flex py-4 truncate w-[160px] extra-column font-medium text-[14px] items-center justify-start";
+    cell.dataset.key = key;
+    const value = totalPortfolioStats[key];
+    if (value === null || value === undefined || value === "-" || value === "—") {
+      cell.innerHTML = '<span class="text-black/40">—</span>';
+    } else {
+      cell.textContent = value;
+    }
+    row.appendChild(cell);
+  });
+
+  tbody.insertBefore(row, tbody.firstChild);
 }
 
 export function updateRowStats(row, addedStats) {
